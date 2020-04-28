@@ -1,5 +1,9 @@
 #include <iostream>
 #include <vector>
+#include <iostream>
+#include <ctime>
+#include <ratio>
+#include <chrono>
 #include <CL/sycl.hpp>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -29,7 +33,6 @@ range<2> get_optimal_local_range(cl::sycl::range<2> globalSize,
 
 int main(int, char**) {
     int width, height, channels;
-
     //Load image
     unsigned char *img = stbi_load("wot.jpg", &width, &height, &channels, 0);
     if(img == NULL) {
@@ -64,6 +67,7 @@ int main(int, char**) {
     unsigned char *final_image = new unsigned char[img_size * sizeof(unsigned char)];
     unsigned char *r_curr_pix, *g_curr_pix, *b_curr_pix;
     int capacity = (filter_size - 1) / 2;
+    auto start_time = chrono::high_resolution_clock::now();
     for(int i = 0; i <= height - 1; i++) {
         for(int j = 0; j <= width - 1; j++) {
             vector<double> sum(3, 0);
@@ -86,6 +90,9 @@ int main(int, char**) {
             sum.clear();
         }
     }
+    auto end_time = chrono::high_resolution_clock::now();
+    std::cout << "Native method's time: " << chrono::duration_cast<chrono::microseconds>((end_time - start_time) / 1000).count() <<
+    " microseconds" << std::endl;
     stbi_write_jpg("wot_native_methods.jpg", width, height, channels, final_image, 100);
 
 
@@ -154,6 +161,7 @@ int main(int, char**) {
         
         std::vector<int> finalIMG_vector(img_size, 0);
         buffer<int> finalIMG_buffer(finalIMG_vector.data(), cl::sycl::range<1>(imgSize));
+        start_time = chrono::high_resolution_clock::now();
         Queue.submit([&](cl::sycl::handler& cgh) {
             cl::sycl::stream kernelout(320000, 1024, cgh);
             auto globalRGB = RGB_buffer.get_access<access::mode::read>(cgh);
@@ -178,6 +186,10 @@ int main(int, char**) {
                 }
             });
         });
+        end_time = chrono::high_resolution_clock::now();
+        std::cout << "Parallel method's time: " << chrono::duration_cast<chrono::microseconds>((end_time - start_time) / 1000).count() << 
+        " microseconds" << std::endl;
+
 
         auto globalFinalImg = finalIMG_buffer.get_access<access::mode::read>();
         for(int i = 0; i < pixCount; i++) {
