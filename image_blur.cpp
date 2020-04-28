@@ -9,6 +9,24 @@
 using namespace cl::sycl;
 using namespace std;
 
+range<2> get_optimal_local_range(cl::sycl::range<2> globalSize,
+                                 cl::sycl::device d) {
+    range<2> optimalLocalSize(0, 0);
+
+    if (d.is_gpu()) {
+        optimalLocalSize = range<2>(64, 1);
+    } else {
+        optimalLocalSize = range<2>(4, 1);
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        while (globalSize[i] % optimalLocalSize[i]) {
+            optimalLocalSize[i] = optimalLocalSize[i] >> 1;
+        }
+    }
+    return optimalLocalSize;
+}
+
 int main(int, char**) {
     int width, height, channels;
 
@@ -68,5 +86,106 @@ int main(int, char**) {
             sum.clear();
         }
     }
-    stbi_write_jpg("test_test_test.jpg", width, height, channels, final_image, 100);
+    stbi_write_jpg("wot_native_methods.jpg", width, height, channels, final_image, 100);
+
+
+    /*
+        SYCL implementation
+    */
+    static constexpr auto filterSize = 7;
+    unsigned char* inputData = nullptr;
+    unsigned char* outputData = nullptr;
+    int inputWidth, inputHeight;
+    // Load image
+    inputData = stbi_load("wot.jpg", &inputWidth, &inputHeight, &channels, 0);
+
+    int imgSize = inputWidth * inputHeight * channels;
+    int pixCount = inputWidth * inputHeight;
+    // Create image and flilter range
+    range<2> imgRange(inputHeight, inputWidth);
+    range<2> filterRange(filterSize, filterSize);
+    // Final image
+    outputData = new unsigned char[imgSize];
+
+
+    // Create queue
+    queue Queue([](cl::sycl::exception_list l) {
+    for (auto ep : l) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const cl::sycl::exception& e) {
+            std::cout << "Async exception caught:\n" << e.what() << "\n";
+            throw;
+        }
+    }
+    });
+
+    vector<int> imgData(imgSize);
+    for(int i = 0; i < pixCount; i++) {
+        imgData[i * channels] = (int(*(inputData + i * channels)));
+        imgData[i * channels + 1] = (int(*(inputData + i * channels + 1)));
+        imgData[i * channels + 2] = (int(*(inputData + i * channels + 2)));
+    }
+
+    {
+        /*
+            Create filter's kernel
+        */  
+        buffer<float, 2> blur(filterRange);
+        Queue.submit([&](cl::sycl::handler& cgh) {
+            auto globalBlur = blur.get_access<access::mode::discard_write>(cgh);
+            cgh.parallel_for<class blurFilter>(filterRange, [=](cl::sycl::item<2> i) {
+                globalBlur[i] = 1. / (filterSize * filterSize);
+            });
+        });
+        cl::sycl::buffer<int> imgData_buffer(imgData.data(), cl::sycl::range<1>(imgSize));
+        cl::sycl::buffer<int> RGB_buffer(imgSize);
+
+        Queue.submit([&](cl::sycl::handler& cgh) {
+            auto globalImgBuf = imgData_buffer.get_access<access::mode::read>(cgh);
+            auto globalRGB = RGB_buffer.get_access<access::mode::write>(cgh);
+            cgh.parallel_for<class to_rgb>(cl::sycl::range<1>(pixCount), [=](cl::sycl::nd_item<1> item) {
+                int wiID = item.get_global_id()[0];
+                globalRGB[wiID] = globalImgBuf[wiID * channels];
+                globalRGB[wiID + pixCount] = globalImgBuf[wiID * channels + 1];
+                globalRGB[wiID + 2 * pixCount] = globalImgBuf[wiID * channels + 2];
+            });
+        });
+        
+        std::vector<int> finalIMG_vector(img_size, 0);
+        buffer<int> finalIMG_buffer(finalIMG_vector.data(), cl::sycl::range<1>(imgSize));
+        Queue.submit([&](cl::sycl::handler& cgh) {
+            cl::sycl::stream kernelout(320000, 1024, cgh);
+            auto globalRGB = RGB_buffer.get_access<access::mode::read>(cgh);
+            auto globalBlur = blur.get_access<access::mode::read>(cgh);
+            auto globalFinalImg = finalIMG_buffer.get_access<access::mode::write>(cgh);
+
+            cgh.parallel_for<class create_final_image>(cl::sycl::range<1>(pixCount), [=](cl::sycl::nd_item<1> item) {
+                int wiID = item.get_global_id()[0];
+                constexpr auto offset = (filterSize - 1) / 2;
+                for (int x = -offset; x <= offset; x++) {
+                    for (int y = -offset; y <= offset; y++) {
+                        if(((wiID % inputWidth) + y) < 0 || (int(wiID / inputWidth) + 1 + x) < 0) {
+                            continue;
+                        }
+                        auto r_curr_pix = wiID;
+                        auto g_curr_pix = wiID + pixCount;
+                        auto b_curr_pix = wiID + 2 * pixCount;
+                        globalFinalImg[wiID * channels] += globalRGB[r_curr_pix + x * inputWidth + y] * globalBlur[offset + x][offset + y];// for R
+                        globalFinalImg[wiID * channels + 1] += globalRGB[g_curr_pix + x * inputWidth + y] * globalBlur[offset + x][offset + y];// for G
+                        globalFinalImg[wiID * channels + 2] += globalRGB[b_curr_pix + x * inputWidth + y] * globalBlur[offset + x][offset + y];// for B
+                    }
+                }
+            });
+        });
+
+        auto globalFinalImg = finalIMG_buffer.get_access<access::mode::read>();
+        for(int i = 0; i < pixCount; i++) {
+            *(outputData + i * channels) = globalFinalImg[i * channels];
+            *(outputData + i * channels + 1) = globalFinalImg[i * channels + 1];
+            *(outputData + i * channels + 2) = globalFinalImg[i * channels + 2];
+        }
+            stbi_write_jpg("wot_sycl.jpg", inputWidth, inputHeight, channels, outputData, 100);
+
+    } 
 }
